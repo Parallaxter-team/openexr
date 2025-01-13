@@ -46,21 +46,25 @@ static int
 compare_files (const char* fn, const char* fn2)
 {
     struct stat sb1, sb2;
-    if (0 == stat (fn, &sb1) && 0 == stat (fn2, &sb2))
+    int fd1 = -1, fd2 = -1;
+    int ret = 0;
+
+    fd1 = open (fn, O_RDONLY);
+    fd2 = open (fn2, O_RDONLY);
+    if (fd1 >= 0 && fd2 >= 0)
     {
-        if (sb1.st_size != sb2.st_size)
+        if (0 == fstat (fd1, &sb1) && 0 == fstat (fd2, &sb2))
         {
-            std::cerr << "File sizes do not match: '" << fn << "' "
-                      << sb1.st_size << " '" << fn2 << "' " << sb2.st_size
-                      << std::endl;
-            return 1;
-        }
-        int fd1, fd2;
-        int ret = 0;
-        fd1     = open (fn, O_RDONLY);
-        fd2     = open (fn2, O_RDONLY);
-        if (fd1 >= 0 && fd2 >= 0)
-        {
+            if (sb1.st_size != sb2.st_size)
+            {
+                std::cerr << "File sizes do not match: '" << fn << "' "
+                          << sb1.st_size << " '" << fn2 << "' " << sb2.st_size
+                          << std::endl;
+                close (fd1);
+                close (fd2);
+                return 1;
+            }
+
             uint8_t buf1[512], buf2[512];
             size_t  toRead   = sb1.st_size;
             size_t  chunkReq = sizeof (buf1);
@@ -111,9 +115,11 @@ compare_files (const char* fn, const char* fn2)
     }
     else
     {
-        std::cerr << "Unable to stat '" << fn << "' and '" << fn2 << "'"
+        std::cerr << "Unable to open '" << fn << "' and '" << fn2 << "'"
                   << std::endl;
     }
+    if (fd1 >= 0) close (fd1);
+    if (fd2 >= 0) close (fd2);
     return -1;
 }
 #endif /* linux */
@@ -1066,8 +1072,8 @@ saveCPP (
         (Box2i (V2i (dwx, dwy), V2i (dwx + fw - 1, dwy + fh - 1))));
 
     hdr.compression ()         = (IMF::Compression) ((int) comp);
-    hdr.zipCompressionLevel () = 3;
-    EXRCORE_TEST (((const Header&) hdr).zipCompressionLevel () == 3);
+    hdr.zipCompressionLevel () = 4;
+    EXRCORE_TEST (((const Header&) hdr).zipCompressionLevel () == 4);
 
     hdr.channels ().insert ("I", Channel (IMF::UINT, xs, ys));
     for (int c = 0; c < 5; ++c)
@@ -1315,7 +1321,7 @@ doWriteRead (
     if (tiled)
     {
         EXRCORE_TEST_RVAL (exr_set_tile_descriptor (
-            f, partidx, 32, 32, EXR_TILE_ONE_LEVEL, EXR_TILE_ROUND_UP));
+            f, partidx, 32, 32, EXR_TILE_ONE_LEVEL, EXR_TILE_ROUND_DOWN));
     }
 
     EXRCORE_TEST_RVAL (exr_add_channel (
@@ -1360,12 +1366,10 @@ doWriteRead (
     }
 
 #ifdef __linux
-    if (getenv ("ENABLE_EXACT_FILE_COMPARE") &&
-        0 != compare_files (filename.c_str (), cppfilename.c_str ()))
+    if (0 != compare_files (filename.c_str (), cppfilename.c_str ()))
     {
         EXRCORE_TEST_FAIL (compare_files);
     }
-    else { compare_files (filename.c_str (), cppfilename.c_str ()); }
 #endif
     pixels restore    = p;
     pixels cpprestore = p;

@@ -5,9 +5,12 @@
 
 #include "internal_file.h"
 
+#include "openexr_compression.h"
+
 #include "internal_attr.h"
 #include "internal_constants.h"
 #include "internal_structs.h"
+#include "internal_util.h"
 #include "internal_xdr.h"
 
 #include <limits.h>
@@ -70,6 +73,9 @@ scratch_attr_too_big (struct _internal_exr_seq_scratch* scr, int32_t attrsz)
         int64_t foff = (int64_t) scr->fileoff;
         if ((foff + test) > scr->ctxt->file_size) return 1;
     }
+    else if (acmp > scr->navail && acmp >= INT32_MAX)
+        return 1;
+
     return 0;
 }
 
@@ -353,6 +359,7 @@ extract_attr_chlist (
 
         if (attrsz < 16)
         {
+            scratch->sequential_skip (scratch, attrsz);
             return ctxt->print_error (
                 ctxt,
                 EXR_ERR_ATTR_SIZE_MISMATCH,
@@ -375,6 +382,9 @@ extract_attr_chlist (
         xsamp = (int32_t) one_to_native32 ((uint32_t) xsamp);
         ysamp = (int32_t) one_to_native32 ((uint32_t) ysamp);
 
+        if (ptype < 0 || ptype > (int)EXR_PIXEL_LAST_TYPE)
+            ptype = (int)EXR_PIXEL_LAST_TYPE;
+
         rv = exr_attr_chlist_add_with_length (
             ctxt,
             attrdata,
@@ -385,6 +395,7 @@ extract_attr_chlist (
             xsamp,
             ysamp);
     }
+    scratch->sequential_skip (scratch, attrsz);
     return rv;
 }
 
@@ -596,7 +607,7 @@ extract_attr_string_vector (
 
         pulled += sizeof (int32_t);
         nlen = (int32_t) one_to_native32 ((uint32_t) nlen);
-        if (nlen < 0 || (ctxt->file_size > 0 && nlen > ctxt->file_size))
+        if (nlen < 0 || nlen > (attrsz - pulled))
         {
             rv = ctxt->print_error (
                 ctxt,
@@ -849,15 +860,6 @@ check_populate_channels (
     exr_attr_chlist_t tmpchans = {0};
     exr_result_t      rv;
 
-    if (curpart->channels)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute 'channels' encountered");
-    }
-
     if (0 != strcmp (tname, "chlist"))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -868,8 +870,28 @@ check_populate_channels (
             tname);
     }
 
+    if (curpart->channels)
+    {
+        if (ctxt->strict_header)
+        {
+            scratch->sequential_skip (scratch, attrsz);
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute 'channels' encountered");
+        }
+
+        /* legacy code allowed channels to just accumulate, preserve
+         * that behavior (barring other failure)
+         */
+        return extract_attr_chlist (
+            ctxt, scratch, curpart->channels->chlist,
+            EXR_REQ_CHANNELS_STR, tname, attrsz);
+    }
+
     rv = extract_attr_chlist (
         ctxt, scratch, &(tmpchans), EXR_REQ_CHANNELS_STR, tname, attrsz);
+
     if (rv != EXR_ERR_SUCCESS)
     {
         exr_attr_chlist_destroy (ctxt, &(tmpchans));
@@ -913,16 +935,6 @@ check_populate_compression (
     uint8_t      data;
     exr_result_t rv;
 
-    if (curpart->compression)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_COMP_STR);
-    }
-
     if (0 != strcmp (tname, EXR_REQ_COMP_STR))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -943,6 +955,25 @@ check_populate_compression (
         attrsz,
         (uint8_t) EXR_COMPRESSION_LAST_TYPE);
     if (rv != EXR_ERR_SUCCESS) return rv;
+
+    if (curpart->compression)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_COMP_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        curpart->compression->uc = data;
+        curpart->comp_type       = (exr_compression_t) data;
+        return EXR_ERR_SUCCESS;
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -977,16 +1008,6 @@ check_populate_dataWindow (
     exr_attr_box2i_t tmpdata = {0};
     exr_result_t     rv;
 
-    if (curpart->dataWindow)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_DATA_STR);
-    }
-
     if (0 != strcmp (tname, "box2i"))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -1001,6 +1022,25 @@ check_populate_dataWindow (
     rv = extract_attr_32bit (
         ctxt, scratch, &(tmpdata), EXR_REQ_DATA_STR, tname, attrsz, 4);
     if (rv != EXR_ERR_SUCCESS) return rv;
+
+    if (curpart->dataWindow)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_DATA_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        *(curpart->dataWindow->box2i) = tmpdata;
+        curpart->data_window          = tmpdata;
+        return EXR_ERR_SUCCESS;
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -1035,16 +1075,6 @@ check_populate_displayWindow (
     exr_attr_box2i_t tmpdata = {0};
     exr_result_t     rv;
 
-    if (curpart->displayWindow)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_DISP_STR);
-    }
-
     if (0 != strcmp (tname, "box2i"))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -1059,6 +1089,25 @@ check_populate_displayWindow (
     rv = extract_attr_32bit (
         ctxt, scratch, &(tmpdata), EXR_REQ_DISP_STR, tname, attrsz, 4);
     if (rv != EXR_ERR_SUCCESS) return rv;
+
+    if (curpart->displayWindow)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_DISP_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        *(curpart->displayWindow->box2i) = tmpdata;
+        curpart->display_window          = tmpdata;
+        return EXR_ERR_SUCCESS;
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -1093,16 +1142,6 @@ check_populate_lineOrder (
     uint8_t      data;
     exr_result_t rv;
 
-    if (curpart->lineOrder)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_LO_STR);
-    }
-
     if (0 != strcmp (tname, EXR_REQ_LO_STR))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -1123,6 +1162,25 @@ check_populate_lineOrder (
         attrsz,
         (uint8_t) EXR_LINEORDER_LAST_TYPE);
     if (rv != EXR_ERR_SUCCESS) return rv;
+
+    if (curpart->lineOrder)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_LO_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        curpart->lineOrder->uc = data;
+        curpart->lineorder     = data;
+        return EXR_ERR_SUCCESS;
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -1161,16 +1219,6 @@ check_populate_pixelAspectRatio (
         float    fval;
     } tpun;
 
-    if (curpart->pixelAspectRatio)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_PAR_STR);
-    }
-
     if (0 != strcmp (tname, "float"))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -1204,6 +1252,24 @@ check_populate_pixelAspectRatio (
 
     tpun.ival = one_to_native32 (tpun.ival);
 
+    if (curpart->pixelAspectRatio)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_PAR_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        curpart->pixelAspectRatio->f = tpun.fval;
+        return EXR_ERR_SUCCESS;
+    }
+
     rv = exr_attr_list_add_static_name (
         ctxt,
         &(curpart->attributes),
@@ -1235,16 +1301,6 @@ check_populate_screenWindowCenter (
 {
     exr_result_t   rv;
     exr_attr_v2f_t tmpdata;
-
-    if (curpart->screenWindowCenter)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_SCR_WC_STR);
-    }
 
     if (0 != strcmp (tname, "v2f"))
     {
@@ -1279,6 +1335,24 @@ check_populate_screenWindowCenter (
             attrsz);
 
     priv_to_native32 (&tmpdata, 2);
+
+    if (curpart->screenWindowCenter)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_SCR_WC_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        *(curpart->screenWindowCenter->v2f) = tmpdata;
+        return EXR_ERR_SUCCESS;
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -1316,16 +1390,6 @@ check_populate_screenWindowWidth (
         float    fval;
     } tpun;
 
-    if (curpart->screenWindowWidth)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute '%s' encountered",
-            EXR_REQ_SCR_WW_STR);
-    }
-
     if (0 != strcmp (tname, "float"))
     {
         scratch->sequential_skip (scratch, attrsz);
@@ -1359,6 +1423,24 @@ check_populate_screenWindowWidth (
 
     tpun.ival = one_to_native32 (tpun.ival);
 
+    if (curpart->screenWindowWidth)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute '%s' encountered",
+                EXR_REQ_SCR_WW_STR);
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        curpart->screenWindowWidth->f = tpun.fval;
+        return EXR_ERR_SUCCESS;
+    }
+
     rv = exr_attr_list_add_static_name (
         ctxt,
         &(curpart->attributes),
@@ -1390,15 +1472,7 @@ check_populate_tiles (
 {
     exr_result_t        rv;
     exr_attr_tiledesc_t tmpdata = {0};
-
-    if (curpart->tiles)
-    {
-        scratch->sequential_skip (scratch, attrsz);
-        return ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "Duplicate copy of required attribute 'tiles' encountered");
-    }
+    uint8_t             lev, rnd;
 
     if (0 != strcmp (tname, "tiledesc"))
     {
@@ -1427,6 +1501,42 @@ check_populate_tiles (
 
     tmpdata.x_size = one_to_native32 (tmpdata.x_size);
     tmpdata.y_size = one_to_native32 (tmpdata.y_size);
+
+    lev = tmpdata.level_and_round & 0xF;
+    rnd = (tmpdata.level_and_round >> 4) & 0xF;
+    if (lev >= (uint8_t)EXR_TILE_LAST_TYPE)
+    {
+        return ctxt->print_error (
+            ctxt,
+            EXR_ERR_INVALID_ATTR,
+            "Invalid level mode (%d) in tile description header",
+            (int) lev);
+    }
+    if (rnd >= (uint8_t)EXR_TILE_ROUND_LAST_TYPE)
+    {
+        return ctxt->print_error (
+            ctxt,
+            EXR_ERR_INVALID_ATTR,
+            "Invalid rounding mode (%d) in tile description header",
+            (int) rnd);
+    }
+
+    if (curpart->tiles)
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "Duplicate copy of required attribute 'tiles' encountered");
+        }
+
+        /* legacy code allowed attributes to just overwrite, preserve
+         * that behavior (barring other failure)
+         */
+        *(curpart->tiles->tiledesc) = tmpdata;
+        return EXR_ERR_SUCCESS;
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -1596,22 +1706,35 @@ check_populate_type (
     }
 
     if (strcmp ((const char*) outstr, "scanlineimage") == 0)
-        curpart->storage_mode = EXR_STORAGE_SCANLINE;
+    {
+        if (ctxt->has_nonimage_data || ctxt->is_multipart)
+            curpart->storage_mode = EXR_STORAGE_SCANLINE;
+    }
     else if (strcmp ((const char*) outstr, "tiledimage") == 0)
-        curpart->storage_mode = EXR_STORAGE_TILED;
+    {
+        if (ctxt->has_nonimage_data || ctxt->is_multipart)
+            curpart->storage_mode = EXR_STORAGE_TILED;
+    }
     else if (strcmp ((const char*) outstr, "deepscanline") == 0)
-        curpart->storage_mode = EXR_STORAGE_DEEP_SCANLINE;
+    {
+        if (ctxt->has_nonimage_data || ctxt->is_multipart)
+            curpart->storage_mode = EXR_STORAGE_DEEP_SCANLINE;
+    }
     else if (strcmp ((const char*) outstr, "deeptile") == 0)
-        curpart->storage_mode = EXR_STORAGE_DEEP_TILED;
+    {
+        if (ctxt->has_nonimage_data || ctxt->is_multipart)
+            curpart->storage_mode = EXR_STORAGE_DEEP_TILED;
+    }
     else
     {
-        rv = ctxt->print_error (
-            ctxt,
-            EXR_ERR_INVALID_ATTR,
-            "attribute 'type': Invalid type string '%s'",
-            outstr);
-        exr_attr_list_remove (ctxt, &(curpart->attributes), curpart->type);
-        curpart->type = NULL;
+        if (ctxt->strict_header)
+            ctxt->print_error (
+                ctxt,
+                EXR_ERR_INVALID_ATTR,
+                "attribute 'type': Unknown type string '%s'",
+                outstr);
+        if (curpart->storage_mode == EXR_STORAGE_LAST_TYPE)
+            curpart->storage_mode = EXR_STORAGE_UNKNOWN;
     }
 
     return rv;
@@ -1664,8 +1787,13 @@ check_populate_version (
 
     attrsz = (int32_t) one_to_native32 ((uint32_t) attrsz);
     if (attrsz != 1)
-        return ctxt->print_error (
-            ctxt, EXR_ERR_INVALID_ATTR, "Invalid version %d: expect 1", attrsz);
+    {
+        if (ctxt->strict_header)
+        {
+            return ctxt->print_error (
+                ctxt, EXR_ERR_INVALID_ATTR, "Invalid version %d: expect 1", attrsz);
+        }
+    }
 
     rv = exr_attr_list_add_static_name (
         ctxt,
@@ -2022,27 +2150,37 @@ pull_attr (
             break;
         case EXR_ATTR_V2I:
             rv = extract_attr_32bit (
-                ctxt, scratch, nattr->v2i->arr, name, type, attrsz, 2);
+                ctxt, scratch, nattr->v2i, name, type, attrsz, 2);
             break;
         case EXR_ATTR_V2F:
             rv = extract_attr_32bit (
-                ctxt, scratch, nattr->v2f->arr, name, type, attrsz, 2);
+                ctxt, scratch, nattr->v2f, name, type, attrsz, 2);
             break;
         case EXR_ATTR_V2D:
             rv = extract_attr_64bit (
-                ctxt, scratch, nattr->v2d->arr, name, type, attrsz, 2);
+                ctxt, scratch, nattr->v2d, name, type, attrsz, 2);
             break;
         case EXR_ATTR_V3I:
             rv = extract_attr_32bit (
-                ctxt, scratch, nattr->v3i->arr, name, type, attrsz, 3);
+                ctxt, scratch, nattr->v3i, name, type, attrsz, 3);
             break;
         case EXR_ATTR_V3F:
             rv = extract_attr_32bit (
-                ctxt, scratch, nattr->v3f->arr, name, type, attrsz, 3);
+                ctxt, scratch, nattr->v3f, name, type, attrsz, 3);
             break;
         case EXR_ATTR_V3D:
             rv = extract_attr_64bit (
-                ctxt, scratch, nattr->v3d->arr, name, type, attrsz, 3);
+                ctxt, scratch, nattr->v3d, name, type, attrsz, 3);
+            break;
+        case EXR_ATTR_DEEP_IMAGE_STATE:
+            rv = extract_attr_uint8 (
+                ctxt,
+                scratch,
+                &(nattr->uc),
+                name,
+                type,
+                attrsz,
+                (uint8_t) EXR_DIS_LAST_TYPE);
             break;
         case EXR_ATTR_OPAQUE:
             rv = extract_attr_opaque (
@@ -2122,7 +2260,11 @@ internal_exr_compute_tile_information (
 {
     exr_result_t rv = EXR_ERR_SUCCESS;
     if (curpart->storage_mode == EXR_STORAGE_SCANLINE ||
-        curpart->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+        curpart->storage_mode == EXR_STORAGE_DEEP_SCANLINE ||
+        curpart->storage_mode == EXR_STORAGE_UNKNOWN)
+        return EXR_ERR_SUCCESS;
+
+    if (ctxt->mode == EXR_CONTEXT_TEMPORARY && !curpart->tiles)
         return EXR_ERR_SUCCESS;
 
     if (rebuild && (!curpart->dataWindow || !curpart->tiles))
@@ -2257,6 +2399,13 @@ internal_exr_compute_chunk_offset_size (exr_priv_part_t curpart)
     uint64_t                 w;
     int                      hasLineSample = 0;
 
+    if (curpart->storage_mode == EXR_STORAGE_UNKNOWN)
+    {
+        if (curpart->chunk_count > 0)
+            return curpart->chunk_count;
+        return 0;
+    }
+
     w = (uint64_t) (((int64_t) dw.max.x) - ((int64_t) dw.min.x) + 1);
 
     if (curpart->tiles)
@@ -2295,21 +2444,14 @@ internal_exr_compute_chunk_offset_size (exr_priv_part_t curpart)
 
         for (int c = 0; c < channels->num_channels; ++c)
         {
-            uint64_t xsamp  = (uint64_t) channels->entries[c].x_sampling;
-            uint64_t ysamp  = (uint64_t) channels->entries[c].y_sampling;
+            /* tiles do not allow x/y sub sampling */
             uint64_t cunpsz = 0;
             if (channels->entries[c].pixel_type == EXR_PIXEL_HALF)
                 cunpsz = 2;
             else
                 cunpsz = 4;
-            cunpsz *= (((uint64_t) tiledesc->x_size + xsamp - 1) / xsamp);
-            if (ysamp > 1)
-            {
-                hasLineSample = 1;
-                cunpsz *= (((uint64_t) tiledesc->y_size + ysamp - 1) / ysamp);
-            }
-            else
-                cunpsz *= (uint64_t) tiledesc->y_size;
+            cunpsz *= (uint64_t) tiledesc->x_size;
+            cunpsz *= (uint64_t) tiledesc->y_size;
             unpackedsize += cunpsz;
         }
         curpart->unpacked_size_per_chunk = unpackedsize;
@@ -2317,46 +2459,31 @@ internal_exr_compute_chunk_offset_size (exr_priv_part_t curpart)
     }
     else
     {
-        uint64_t linePerChunk, h;
-        switch (curpart->comp_type)
-        {
-            case EXR_COMPRESSION_NONE:
-            case EXR_COMPRESSION_RLE:
-            case EXR_COMPRESSION_ZIPS: linePerChunk = 1; break;
-            case EXR_COMPRESSION_ZIP:
-            case EXR_COMPRESSION_PXR24: linePerChunk = 16; break;
-            case EXR_COMPRESSION_PIZ:
-            case EXR_COMPRESSION_B44:
-            case EXR_COMPRESSION_B44A:
-            case EXR_COMPRESSION_DWAA: linePerChunk = 32; break;
-            case EXR_COMPRESSION_DWAB: linePerChunk = 256; break;
-            case EXR_COMPRESSION_LAST_TYPE:
-            default:
-                /* ERROR CONDITION */
-                return -1;
-        }
+        int linePerChunk, h;
+
+        linePerChunk = exr_compression_lines_per_chunk (curpart->comp_type);
+
+        curpart->lines_per_chunk = linePerChunk;
+
+        if (linePerChunk < 0) return -1;
 
         for (int c = 0; c < channels->num_channels; ++c)
         {
-            uint64_t xsamp  = (uint64_t) channels->entries[c].x_sampling;
-            uint64_t ysamp  = (uint64_t) channels->entries[c].y_sampling;
+            int xsamp  = channels->entries[c].x_sampling;
+            int ysamp  = channels->entries[c].y_sampling;
             uint64_t cunpsz = 0;
             if (channels->entries[c].pixel_type == EXR_PIXEL_HALF)
                 cunpsz = 2;
             else
                 cunpsz = 4;
-            cunpsz *= w / xsamp;
-            cunpsz *= linePerChunk;
+            cunpsz *= (uint64_t) compute_sampled_width (w, xsamp, dw.min.x);
+            cunpsz *= (uint64_t) compute_sampled_height (linePerChunk, ysamp, dw.min.y);
             if (ysamp > 1)
-            {
                 hasLineSample = 1;
-                if (linePerChunk > 1) cunpsz *= linePerChunk / ysamp;
-            }
             unpackedsize += cunpsz;
         }
 
         curpart->unpacked_size_per_chunk = unpackedsize;
-        curpart->lines_per_chunk         = ((int16_t) linePerChunk);
         curpart->chan_has_line_sampling  = ((int16_t) hasLineSample);
 
         h      = (uint64_t) ((int64_t) dw.max.y - (int64_t) dw.min.y + 1);
@@ -2411,9 +2538,10 @@ update_chunk_offsets (
             ctxt->print_error (
                 ctxt,
                 EXR_ERR_INVALID_ATTR,
-                "Invalid chunk count (%d) for part '%s', expect (%d)",
+                "Invalid chunk count (%d) for part '%s' (%d), expect (%d)",
                 curpart->chunk_count,
                 (curpart->name ? curpart->name->string->str : "<first>"),
+                p,
                 ccount);
             curpart->chunk_count = ccount;
         }
@@ -2468,6 +2596,7 @@ read_magic_and_flags (exr_context_t ctxt, uint32_t* outflags, uint64_t* initpos)
 
     flags = magic_and_version[1];
 
+    ctxt->orig_version_and_flags = flags;
     ctxt->version = flags & EXR_FILE_VERSION_MASK;
     if (ctxt->version != 2)
     {
@@ -2561,27 +2690,26 @@ internal_exr_parse_header (exr_context_t ctxt)
     {
         if (ctxt->has_nonimage_data || ctxt->is_multipart)
         {
-            if (ctxt->strict_header)
-            {
-                rv = ctxt->print_error (
-                    ctxt,
-                    EXR_ERR_FILE_BAD_HEADER,
-                    "Invalid combination of version flags: single part found, but also marked as deep (%d) or multipart (%d)",
-                    (int) ctxt->has_nonimage_data,
-                    (int) ctxt->is_multipart);
-                priv_destroy_scratch (&scratch);
-                return internal_exr_context_restore_handlers (ctxt, rv);
-            }
-            else
-            {
-                // assume multipart for now
-                ctxt->is_singlepart_tiled = 0;
-            }
+            // this appears to always be fatal, so do not check strict / not
+            rv = ctxt->print_error (
+                ctxt,
+                EXR_ERR_FILE_BAD_HEADER,
+                "Invalid combination of version flags: single part flag found, but also marked as deep (%d) or multipart (%d)",
+                (int) ctxt->has_nonimage_data,
+                (int) ctxt->is_multipart);
+            priv_destroy_scratch (&scratch);
+            return internal_exr_context_restore_handlers (ctxt, rv);
         }
-        curpart->storage_mode = EXR_STORAGE_TILED;
     }
-    else
-        curpart->storage_mode = EXR_STORAGE_SCANLINE;
+
+    /* leave storage mode uninitialized until we encounter the type */
+    if (!ctxt->has_nonimage_data && !ctxt->is_multipart)
+    {
+        if (ctxt->is_singlepart_tiled)
+            curpart->storage_mode = EXR_STORAGE_TILED;
+        else
+            curpart->storage_mode = EXR_STORAGE_SCANLINE;
+    }
 
     do
     {
@@ -2638,6 +2766,42 @@ internal_exr_parse_header (exr_context_t ctxt)
             rv = EXR_ERR_SUCCESS;
         }
     } while (1);
+
+    if (rv == EXR_ERR_SUCCESS)
+    {
+        for ( int p = 1; p < ctxt->num_parts; ++p )
+        {
+            const char *mismatch[4] = { NULL, NULL, NULL, NULL };
+            int mismatchcount = 0;
+            exr_priv_part_t curp = ctxt->parts[p];
+
+            rv = internal_exr_validate_shared_attrs (ctxt,
+                                                     ctxt->parts[0],
+                                                     curp,
+                                                     p,
+                                                     mismatch,
+                                                     &mismatchcount);
+            if (rv != EXR_ERR_SUCCESS)
+            {
+                rv = ctxt->print_error (
+                    ctxt,
+                    rv,
+                    "Part %d (%s) has non-conforming shared attributes: %s%s%s%s%s%s%s",
+                    p, curp->name ? curp->name->string->str : "<missing name>",
+                    mismatch[0] ? mismatch[0] : "",
+                    mismatch[0] ? " " : "",
+                    mismatch[1] ? mismatch[1] : "",
+                    mismatch[1] ? " " : "",
+                    mismatch[2] ? mismatch[2] : "",
+                    mismatch[2] ? " " : "",
+                    mismatch[3] ? mismatch[3] : "");
+
+                // MultiPartInputFile would fail unconditionally
+                break;
+                //rv = EXR_ERR_SUCCESS;
+            }
+        }
+    }
 
     if (rv == EXR_ERR_SUCCESS) { rv = update_chunk_offsets (ctxt, &scratch); }
 

@@ -150,7 +150,7 @@ exr_test_file_header (
     exr_context_t             ret   = NULL;
     exr_context_initializer_t inits = fill_context_data (ctxtdata);
 
-    if (filename && filename[0] != '\0')
+    if (filename)
     {
         rv = internal_exr_alloc_context (
             &ret,
@@ -209,7 +209,9 @@ exr_finish (exr_context_t* pctxt)
             ctxt->mode == EXR_CONTEXT_WRITING_DATA)
             failed = 1;
 
-        if (ctxt->mode != EXR_CONTEXT_READ) rv = finalize_write (ctxt, failed);
+        if (ctxt->mode != EXR_CONTEXT_READ &&
+            ctxt->mode != EXR_CONTEXT_TEMPORARY)
+            rv = finalize_write (ctxt, failed);
 
         if (ctxt->destroy_fn) ctxt->destroy_fn (ctxt, ctxt->user_data, failed);
 
@@ -242,7 +244,7 @@ exr_start_read (
         return EXR_ERR_INVALID_ARGUMENT;
     }
 
-    if (filename && filename[0] != '\0')
+    if (filename)
     {
         rv = internal_exr_alloc_context (
             &ret,
@@ -309,7 +311,7 @@ exr_start_write (
         return EXR_ERR_INVALID_ARGUMENT;
     }
 
-    if (filename && filename[0] != '\0')
+    if (filename)
     {
         rv = internal_exr_alloc_context (
             &ret,
@@ -369,11 +371,41 @@ exr_start_inplace_header_update (
 
 /**************************************/
 
+exr_result_t exr_start_temporary_context (
+    exr_context_t*                   ctxt,
+    const char*                      context_name,
+    const exr_context_initializer_t* ctxtdata)
+{
+    exr_result_t              rv    = EXR_ERR_UNKNOWN;
+    exr_context_t             ret   = NULL;
+    exr_context_initializer_t inits = fill_context_data (ctxtdata);
+
+    if (!ctxt) return EXR_ERR_INVALID_ARGUMENT;
+
+    rv = internal_exr_alloc_context (
+        &ret,
+        &inits,
+        EXR_CONTEXT_TEMPORARY,
+        0);
+
+    if (rv == EXR_ERR_SUCCESS)
+    {
+        rv = exr_attr_string_create (
+            (exr_context_t) ret, &(ret->filename), context_name ? context_name : "<temporary>");
+        if (rv != EXR_ERR_SUCCESS) exr_finish ((exr_context_t*) &ret);
+    }
+
+    *ctxt = (exr_context_t) ret;
+    return rv;
+}
+
+
+/**************************************/
+
 exr_result_t
 exr_get_file_name (exr_const_context_t ctxt, const char** name)
 {
     if (!ctxt) return EXR_ERR_MISSING_CONTEXT_ARG;
-    if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_lock (ctxt);
 
     /* not changeable after construction, no locking needed */
     if (name)
@@ -381,6 +413,30 @@ exr_get_file_name (exr_const_context_t ctxt, const char** name)
         *name = ctxt->filename.str;
         if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_unlock (ctxt);
         return EXR_ERR_SUCCESS;
+    }
+
+    return ctxt->standard_error (ctxt, EXR_ERR_INVALID_ARGUMENT);
+}
+
+/**************************************/
+
+exr_result_t
+exr_get_file_version_and_flags (exr_const_context_t ctxt, uint32_t* ver)
+{
+    if (!ctxt) return EXR_ERR_MISSING_CONTEXT_ARG;
+    if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_lock (ctxt);
+
+    if (ver)
+    {
+        exr_result_t ret = EXR_ERR_SUCCESS;
+
+        if (ctxt->orig_version_and_flags != 0)
+            *ver = ctxt->orig_version_and_flags;
+        else
+            ret = internal_exr_calc_header_version_flags (ctxt, ver);
+
+        if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_unlock (ctxt);
+        return ret;
     }
 
     if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_unlock (ctxt);
@@ -517,13 +573,18 @@ exr_set_longname_support (exr_context_t ctxt, int onoff)
     if (!ctxt) return EXR_ERR_MISSING_CONTEXT_ARG;
     internal_exr_lock (ctxt);
 
-    if (ctxt->mode != EXR_CONTEXT_WRITE)
+    if (ctxt->mode != EXR_CONTEXT_WRITE && ctxt->mode != EXR_CONTEXT_TEMPORARY)
         return EXR_UNLOCK_AND_RETURN (
             ctxt->standard_error (ctxt, EXR_ERR_NOT_OPEN_WRITE));
 
     oldval = ctxt->max_name_length;
     newval = EXR_SHORTNAME_MAXLEN;
-    if (onoff) newval = EXR_LONGNAME_MAXLEN;
+    if (onoff)
+    {
+        newval        = EXR_LONGNAME_MAXLEN;
+        ctxt->version = 2;
+    }
+    else { ctxt->version = 1; }
 
     if (oldval > newval)
     {
@@ -589,6 +650,23 @@ exr_write_header (exr_context_t ctxt)
             EXR_ERR_FILE_BAD_HEADER,
             "No parts defined in file prior to writing data"));
 
+    /* add part and set name should have already validated the uniqueness
+     * so just ensure the name has been set for multi part files
+     */
+    for ( int p = ctxt->num_parts > 1 ? 0 : 1; p < ctxt->num_parts; ++p )
+    {
+        const exr_attribute_t* pname = ctxt->parts[p]->name;
+        if (!pname)
+        {
+            return EXR_UNLOCK_AND_RETURN (
+                ctxt->print_error (
+                    ctxt,
+                    EXR_ERR_INVALID_ARGUMENT,
+                    "Part %d missing required name for multi-part file",
+                    p));
+        }
+    }
+
     for (int p = 0; rv == EXR_ERR_SUCCESS && p < ctxt->num_parts; ++p)
     {
         exr_priv_part_t curp = ctxt->parts[p];
@@ -606,6 +684,12 @@ exr_write_header (exr_context_t ctxt)
         if (rv != EXR_ERR_SUCCESS) break;
 
         ccount = internal_exr_compute_chunk_offset_size (curp);
+        if (ccount < 0)
+            return EXR_UNLOCK_AND_RETURN (
+                ctxt->report_error (
+                    ctxt,
+                    EXR_ERR_FILE_BAD_HEADER,
+                    "Invalid part specification computing number of chunks in file"));
 
         curp->chunk_count = ccount;
 

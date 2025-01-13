@@ -21,7 +21,7 @@
 
 static exr_result_t
 print_error_helper (
-    exr_context_t               pf,
+    exr_const_context_t         pf,
     exr_result_t                errcode,
     DWORD                       dw,
     exr_stream_error_func_ptr_t error_cb,
@@ -60,11 +60,7 @@ print_error_helper (
     }
 
     if (error_cb)
-        error_cb (
-            (exr_const_context_t) pf,
-            errcode,
-            "%s",
-            (const char*) lpDisplayBuf);
+        error_cb (pf, errcode, "%s", (const char*) lpDisplayBuf);
     else
         pf->print_error (pf, errcode, "%s", (const char*) lpDisplayBuf);
 
@@ -75,19 +71,9 @@ print_error_helper (
 }
 
 static exr_result_t
-print_error (exr_context_t pf, exr_result_t errcode, const char* msg)
+print_error (exr_const_context_t pf, exr_result_t errcode, const char* msg)
 {
     return print_error_helper (pf, errcode, GetLastError (), NULL, msg);
-}
-
-static exr_result_t
-send_error (
-    exr_context_t               pf,
-    exr_result_t                errcode,
-    exr_stream_error_func_ptr_t error_cb,
-    const char*                 msg)
-{
-    return print_error_helper (pf, errcode, GetLastError (), error_cb, msg);
 }
 
 static wchar_t*
@@ -317,12 +303,16 @@ default_init_read_file (exr_context_t file)
     {
 #if defined(_WIN32_WINNT) && (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
         fd = CreateFile2 (
-            wcFn, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, NULL);
+            wcFn,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            OPEN_EXISTING,
+            NULL);
 #else
         fd = CreateFileW (
             wcFn,
             GENERIC_READ,
-            FILE_SHARE_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             NULL,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, /* TBD: use overlapped? | FILE_FLAG_OVERLAPPED */
@@ -366,14 +356,14 @@ default_init_write_file (exr_context_t file)
         fd = CreateFile2 (
             wcFn,
             GENERIC_WRITE | DELETE,
-            0, /* no sharing */
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             CREATE_ALWAYS,
             NULL);
 #else
         fd = CreateFileW (
             wcFn,
             GENERIC_WRITE | DELETE,
-            0, /* no sharing */
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             NULL,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL, /* TBD: use overlapped? | FILE_FLAG_OVERLAPPED */
